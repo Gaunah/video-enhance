@@ -155,6 +155,35 @@ which is where the weights come from. The architecture follows Practical-RIFE
 `caltime` (timestep estimator) submodules in the checkpoints are training-only
 and are dropped on load.
 
+## Troubleshooting
+
+**`Driver does not support the required nvenc API version. Required: 13.1 Found: 13.0`**
+
+The ffmpeg build is newer than the GPU driver, not broken. The static build in
+this image tracks ffmpeg master and is compiled against whatever NVENC SDK was
+current; an older host driver exposes an older API and refuses to open the
+encoder. Either:
+
+- rerun with `--codec libx264` (CPU encode, slow at 4K and above), or
+- pick a RunPod template with a newer driver, or
+- swap the static ffmpeg in the Dockerfile for the distro package
+  (`apt-get install -y ffmpeg`), which is built against older NVENC headers and
+  works with older drivers.
+
+`--codec auto` now test-encodes a frame before committing to NVENC, so it falls
+back to libx264 on its own. Only an explicitly requested `--codec hevc_nvenc`
+will still fail, which is deliberate: silently overriding what you asked for is
+worse than stopping.
+
+**CUDA out of memory.** Add `--tile 512`, or `--tile 256` if that is still too
+big. Tiling is verified to match whole-frame output, so it costs nothing but
+time.
+
+**Frame rate goes down, not up.** `--fps` is the absolute target, not a
+multiplier. Passing `--fps 30` to 60 fps source *halves* the rate by dropping
+frames; RIFE is not invoked at all when the ratio is an exact integer. Use
+`--interp-factor 2` if you want "twice whatever it currently is".
+
 ## Limitations and what to reach for next
 
 RIFE struggles with occlusion boundaries, motion blur, and scene cuts. There is

@@ -56,13 +56,20 @@ def probe(path):
     }
 
 
-def has_encoder(name):
+def encoder_works(name):
+    """Being *built* with an encoder is not the same as being able to *open*
+    it. A static ffmpeg built against a newer NVENC SDK than the host driver
+    supports will happily list hevc_nvenc and then fail at open time with
+    "Driver does not support the required nvenc API version". The only
+    reliable check is to encode a frame and see what happens."""
     try:
-        out = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True, text=True, check=True,
-        ).stdout
-        return name in out
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "nullsrc=s=256x256", "-frames:v", "1",
+             "-c:v", name, "-f", "null", "-"],
+            capture_output=True, timeout=60,
+        )
+        return r.returncode == 0
     except Exception:
         return False
 
@@ -87,12 +94,14 @@ def decoder(path, width, height):
 def encoder(out_path, width, height, fps, src_path, args):
     vcodec, extra = args.codec, []
     if vcodec == "auto":
-        if has_encoder("hevc_nvenc"):
-            vcodec = "hevc_nvenc"
-        elif has_encoder("h264_nvenc"):
-            vcodec = "h264_nvenc"
+        for cand in ("hevc_nvenc", "h264_nvenc"):
+            if encoder_works(cand):
+                vcodec = cand
+                break
         else:
             vcodec = "libx264"
+            print("[encode] no usable NVENC encoder (driver too old for this "
+                  "ffmpeg build?), falling back to libx264", file=sys.stderr)
 
     if "nvenc" in vcodec:
         extra = ["-preset", "p5", "-tune", "hq", "-rc", "vbr",
@@ -248,9 +257,25 @@ def main():
 
         if prev is not None:
             emit(prev)
+    except BrokenPipeError:
+        # The encoder died; its own error is already on stderr above, and is
+        # far more useful than a traceback from this end of the pipe.
+        pass
     finally:
-        enc.stdin.close()
-        enc.wait()
+        try:
+            enc.stdin.close()
+        except BrokenPipeError:
+            pass
+        rc = enc.wait()
+
+    if rc != 0 or written == 0:
+        sys.exit(
+            f"\n[error ] encoder exited with status {rc} after {written} frames. "
+            f"The ffmpeg message above says why.\n"
+            f"         If it mentions the nvenc API version or driver version, "
+            f"this ffmpeg build is newer than the GPU driver; rerun with "
+            f"--codec libx264."
+        )
 
     print(f"\r[done  ] wrote {written} frames to {args.output}", file=sys.stderr)
 

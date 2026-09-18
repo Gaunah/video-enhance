@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Distro ffmpeg builds are inconsistent about NVENC; this one always has it.
+# Caveat: it tracks master, so it may require a newer GPU driver than the host
+# has, in which case NVENC fails to open and enhance.py falls back to libx264.
+# If that happens and you want NVENC, replace this block with:
+#     RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg
 RUN curl -fsSL -o /tmp/ffmpeg.tar.xz \
         https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
     && tar -xf /tmp/ffmpeg.tar.xz -C /tmp \
