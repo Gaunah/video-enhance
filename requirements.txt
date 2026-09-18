@@ -1,0 +1,5 @@
+# The PyPI torch wheel bundles its own CUDA runtime, so the image does not need
+# an nvidia/cuda base - only the host driver, which RunPod provides.
+# Tested against 2.14.0+cu130.
+torch>=2.2
+numpy>=1.24
