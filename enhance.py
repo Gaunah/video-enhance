@@ -23,6 +23,7 @@ from fractions import Fraction
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from esrgan import Upscaler
 from rife import RifeInterpolator
@@ -109,18 +110,12 @@ def encoder(out_path, width, height, fps, src_path, args):
     else:
         extra = ["-preset", args.preset, "-crf", str(args.quality)]
 
-    vf = []
-    if args.out_height:
-        vf.append(f"scale=-2:{args.out_height}:flags=lanczos")
-    filters = ["-vf", ",".join(vf)] if vf else []
-
     cmd = [
         "ffmpeg", "-v", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
         "-i", src_path,
         "-map", "0:v:0", "-map", "1:a?",
-        *filters,
         "-c:v", vcodec, *extra,
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
@@ -138,9 +133,11 @@ def main():
     p.add_argument("output")
 
     p.add_argument("--fps", default=None,
-                   help="target frame rate, e.g. 60 or 60000/1001. Omit to keep source fps")
-    p.add_argument("--interp-factor", type=float, default=None,
-                   help="alternative to --fps, e.g. 2 doubles the frame rate")
+                   help="exact target frame rate, e.g. 60 or 60000/1001. "
+                        "Overrides --interp-factor")
+    p.add_argument("--interp-factor", type=float, default=2.0,
+                   help="frame rate multiplier, default 2 (doubles it). "
+                        "Overridden by --fps; disable with --no-interp")
     p.add_argument("--no-interp", action="store_true")
 
     p.add_argument("--rife-model", default="flownet_v4.25",
@@ -151,8 +148,12 @@ def main():
     p.add_argument("--no-upscale", action="store_true")
     p.add_argument("--tile", type=int, default=0,
                    help="tile size for the upscaler; use 256 or 512 if you hit OOM")
+    p.add_argument("--upscale-factor", type=float, default=None,
+                   help="output scale relative to the source. Default is the "
+                        "model's native scale (4x) with no resampling; set e.g. "
+                        "2 to resample the 4x result down")
     p.add_argument("--out-height", type=int, default=None,
-                   help="downscale after upscaling, e.g. 4x model then --out-height 1080")
+                   help="exact output height, overriding --upscale-factor")
 
     p.add_argument("--rife-scale", type=float, default=1.0,
                    help="0.5 for 4K input, 2.0 for very fast motion at low resolution")
@@ -199,8 +200,29 @@ def main():
         print(f"[upscl ] {args.upscale_model} x{scale} -> {w*scale}x{h*scale}",
               file=sys.stderr)
 
+    # Resolve the final size. By default there is no resampling at all - the
+    # model's native 4x output is what gets encoded. When a smaller size *is*
+    # requested, the resample happens on the GPU rather than in an ffmpeg
+    # filter, so the pipe only carries the final resolution: asking for 2x
+    # moves a quarter of the bytes of the raw 4x output.
+    model_w, model_h = w * scale, h * scale
+    if args.out_height:
+        final_h = args.out_height
+        final_w = round(w * final_h / h)
+    elif args.upscale_factor:
+        final_h = round(h * args.upscale_factor)
+        final_w = round(w * args.upscale_factor)
+    else:
+        final_h, final_w = model_h, model_w
+    final_w -= final_w % 2   # yuv420p needs even dimensions
+    final_h -= final_h % 2
+
+    resize_to = (final_h, final_w) if (final_h, final_w) != (model_h, model_w) else None
+    if resize_to:
+        print(f"[resize] {model_w}x{model_h} -> {final_w}x{final_h}", file=sys.stderr)
+
     dev = torch.device(args.device)
-    enc = encoder(args.output, w * scale, h * scale, out_fps, args.input, args)
+    enc = encoder(args.output, final_w, final_h, out_fps, args.input, args)
 
     def to_tensor(arr):
         t = torch.from_numpy(arr).to(dev)
@@ -212,6 +234,9 @@ def main():
         nonlocal written
         if up is not None:
             t = up.upscale(t)
+        if resize_to is not None:
+            t = F.interpolate(t, size=resize_to, mode="bicubic",
+                              antialias=True, align_corners=False).clamp(0, 1)
         arr = (t[0].permute(1, 2, 0) * 255.0).round().clamp(0, 255).to(torch.uint8)
         enc.stdin.write(arr.cpu().numpy().tobytes())
         written += 1

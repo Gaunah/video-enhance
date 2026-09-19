@@ -9,32 +9,38 @@ low-frame-rate clips. Single container, runs anywhere with an NVIDIA GPU.
 docker build -t video-enhance .
 
 docker run --rm --gpus all -v "$PWD/clips:/data" video-enhance \
-    /data/in.mp4 /data/out.mp4 --fps 60
+    /data/in.mp4 /data/out.mp4
 ```
 
-That reads `in.mp4`, interpolates to 60 fps, upscales 4x, and writes `out.mp4`
-with the original audio.
+With no flags that doubles the frame rate and upscales 4x, the model's native
+scale, keeping the original audio. Both defaults are overridable per run.
 
 ## Common invocations
 
 ```bash
-# 480p/12fps source -> 1080p/60fps (4x model, then resample down to 1080p)
-enhance.py in.mp4 out.mp4 --fps 60 --out-height 1080
+# Pin an exact frame rate instead of a multiplier
+enhance.py in.mp4 out.mp4 --fps 60
+
+# Pin an exact height instead of taking the model's native 4x
+enhance.py in.mp4 out.mp4 --out-height 1080
+
+# 2x instead of 4x (runs the 4x model, resamples down)
+enhance.py in.mp4 out.mp4 --upscale-factor 2
 
 # Upscale only, leave timing alone
 enhance.py in.mp4 out.mp4 --no-interp
 
 # Smooth motion only, keep the resolution
-enhance.py in.mp4 out.mp4 --interp-factor 2 --no-upscale
+enhance.py in.mp4 out.mp4 --no-upscale
 
 # Clean source, want maximum detail (slower)
-enhance.py in.mp4 out.mp4 --fps 60 --upscale-model RealESRGAN_x4plus
+enhance.py in.mp4 out.mp4 --upscale-model RealESRGAN_x4plus
 
 # Try a different interpolation model
-enhance.py in.mp4 out.mp4 --fps 60 --rife-model flownet_v4.6
+enhance.py in.mp4 out.mp4 --rife-model flownet_v4.6
 
 # Out of VRAM
-enhance.py in.mp4 out.mp4 --fps 60 --tile 512
+enhance.py in.mp4 out.mp4 --tile 512
 ```
 
 ## Choosing an upscale model
@@ -44,9 +50,10 @@ enhance.py in.mp4 out.mp4 --fps 60 --tile 512
 | `realesr-general-x4v3` (default) | compact, 1.2M | noisy or compressed sources; fast |
 | `RealESRGAN_x4plus` | RRDBNet-23, 16.7M | most detail on clean footage, roughly 10x slower |
 
-Both are 4x and both ship in the image. To land on a 2x result, upscale 4x and
-come back down with `--out-height`; that consistently looks better than a
-native 2x model.
+Both are 4x and both ship in the image, and 4x is what you get by default with
+no resampling. If you want less, `--upscale-factor 2` or `--out-height` runs the
+4x model and resamples down, which still looks better than a native 2x model
+would.
 
 ## Choosing a RIFE version
 
@@ -87,7 +94,7 @@ the container start command to `sleep infinity` so the pod stays up. Then from
 the web terminal:
 
 ```bash
-cd /app && python enhance.py /workspace/in.mp4 /workspace/out.mp4 --fps 60
+cd /app && python enhance.py /workspace/in.mp4 /workspace/out.mp4
 ```
 
 Upload and download clips over the pod's SSH/SCP endpoint, or via the volume.
@@ -98,7 +105,7 @@ Upload and download clips over the pod's SSH/SCP endpoint, or via the volume.
 git clone <this repo> /workspace/video-enhance && cd /workspace/video-enhance
 pip install -r requirements.txt
 python download_models.py
-python enhance.py /workspace/in.mp4 /workspace/out.mp4 --fps 60
+python enhance.py /workspace/in.mp4 /workspace/out.mp4
 ```
 
 The bundled ffmpeg is the only thing you lose that way; install one with NVENC
@@ -116,12 +123,13 @@ without tiling.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--fps` | source | Target rate. Accepts `60` or `60000/1001` |
-| `--interp-factor` | – | Alternative to `--fps`, e.g. `2` |
+| `--interp-factor` | `2` | Frame rate multiplier |
+| `--fps` | – | Exact target rate, overrides the multiplier. `60` or `60000/1001` |
 | `--no-interp` / `--no-upscale` | – | Skip either stage |
 | `--rife-model` | `flownet_v4.25` | See table above |
 | `--upscale-model` | `realesr-general-x4v3` | See table above |
-| `--out-height` | – | Lanczos resample after upscaling |
+| `--upscale-factor` | model native (4x) | Output scale relative to source |
+| `--out-height` | – | Exact output height, overrides the factor |
 | `--tile` | `0` | Tile size for the upscaler; try `512` or `256` on OOM |
 | `--rife-scale` | `1.0` | `0.5` for 4K input, `2.0` for very fast motion at low res |
 | `--codec` | `auto` | Prefers `hevc_nvenc`, falls back to `libx264` |
@@ -137,6 +145,15 @@ going to 4x/60fps would otherwise be several GB of PNGs.
 Interpolation runs **before** upscaling. Doing it at source resolution is ~16x
 cheaper, and the quality cost is small because RIFE's optical flow does not gain
 much from detail that was hallucinated rather than measured.
+
+By default nothing is resampled: the model's native 4x output is what gets
+encoded. When you do ask for something smaller, the resample happens on the GPU
+rather than in an ffmpeg filter, so the pipe only carries the final resolution.
+Asking for 2x from a 1080p source moves ~25 MB per frame instead of ~99 MB. The
+cost is that torch has no Lanczos kernel, so it uses antialiased bicubic, which
+measures marginally softer than `flags=lanczos` (about 7% less edge energy)
+while landing closer to a reference Lanczos in PSNR. For a 4x pipe saving on the
+downscale path that is a good trade.
 
 Output frame *k* samples the source timeline at `k * src_fps / out_fps`. RIFE
 v4.x accepts an arbitrary timestep, so awkward ratios like 24 to 60 fps are a
@@ -179,10 +196,10 @@ worse than stopping.
 big. Tiling is verified to match whole-frame output, so it costs nothing but
 time.
 
-**Frame rate goes down, not up.** `--fps` is the absolute target, not a
-multiplier. Passing `--fps 30` to 60 fps source *halves* the rate by dropping
-frames; RIFE is not invoked at all when the ratio is an exact integer. Use
-`--interp-factor 2` if you want "twice whatever it currently is".
+**Frame rate goes down, not up.** `--fps` is an absolute target, not a
+multiplier, and it overrides `--interp-factor`. Passing `--fps 30` to a 60 fps
+source *halves* the rate by dropping frames; RIFE is not invoked at all when the
+ratio is an exact integer. Leave `--fps` off to get the default 2x.
 
 ## Limitations and what to reach for next
 
